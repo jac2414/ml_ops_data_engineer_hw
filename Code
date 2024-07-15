@@ -1,0 +1,223 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import pyarrow.parquet as pq
+import sqlite3  
+
+#Optional to load sensor data in a raw/ staging enviornment
+
+table = pq.read_table(parquet_file_path)
+
+df = table.to_pandas()
+conn = sqlite3.connect(':memory:') 
+
+df_filled.to_sql("Sensor_data_raw", conn, if_exists='replace', index=True)
+
+#Transform and Load 
+ 
+def load_clean_save(parquet_file_path, sql_table_name):
+    # Read the Parquet file into a PyArrow Table
+    table = pq.read_table(parquet_file_path)
+   
+    # Convert the PyArrow Table to a Pandas DataFrame
+    df = table.to_pandas()
+    print("Initial DataFrame:")
+    print(df.head())
+    
+    
+    ### DATA CLEANING
+ 
+    # Check for NaN values and handle them based off a few assumptions as there arent any NaN values present in sample parquet
+    
+    if df.isnull().values.any():
+        # Rule 1: Fill NaN in 'value' with the average of the two surrounding values; Assumption: the value scales semi linearly with time
+        df['value'] = df['value'].interpolate(method='linear')
+ 
+        # Rule 2: Fill NaN in 'time' with the average difference in time added to the last populated row; Assumption: readings are taken at semi consistent increments  
+        df['time'] = pd.to_datetime(df['time'])
+        time_diffs = df['time'].diff().dt.total_seconds().mean()
+        df['time'] = df['time'].fillna(method='ffill') + pd.to_timedelta(time_diffs, unit='s')
+ 
+        # Rule 3: Handle NaN in 'robot_id', value; Assumption: a robot will be semi consistent in a given job in the force and axis over which it applies it  
+        def fill_robot_id(group):
+            if group['robot_id'].isnull().any():
+                avg_value_per_robot = group.groupby(['robot_id', 'field'])['value'].mean()
+                closest_robot = avg_value_per_robot.subtract(group['value'].mean()).abs().idxmin()
+                group['robot_id'].fillna(closest_robot, inplace=True)
+            return group
+ 
+        df = df.groupby('run_uuid').apply(fill_robot_id)
+ 
+        # Rule 4: Fill NaN in 'run_uuid' with the closest job id from nearest time, Assumption: if measurements are coming from a single pod then two jobs cant be completed at once 
+        df['run_uuid'] = df['run_uuid'].fillna(method='ffill').fillna(method='bfill')
+ 
+        # Display the cleaned DataFrame
+        print("\nCleaned DataFrame:")
+        print(df.head())
+ 
+    # Check for duplicates and remove them
+    df.drop_duplicates(inplace=True)
+ 
+    # Check data types
+    expected_dtypes = {
+        'time': 'datetime64[ns]',
+        'value': 'float64',
+        'field': 'object',
+        'robot_id': 'int64',
+        'run_uuid': 'object',
+        'sensor_type': 'object'
+    }
+    
+    #fix data types
+ 
+    for col, dtype in expected_dtypes.items():
+        if df[col].dtype != dtype:
+            df[col] = df[col].astype(dtype)
+ 
+    # Check for consistency
+    encoder_fields = ['x', 'y', 'z']
+    load_cell_fields = ['fx', 'fy', 'fz']
+ 
+    inconsistent_rows = df[
+        ((df['sensor_type'] == 'encoder') & (~df['field'].isin(encoder_fields))) |
+        ((df['sensor_type'] == 'load_cell') & (~df['field'].isin(load_cell_fields)))
+    ]
+    
+    
+    #Drop inconsistent rows (i.e. sensor failures)
+ 
+    if not inconsistent_rows.empty:
+        df.drop(inconsistent_rows.index, inplace=True)
+ 
+    invalid_robot_ids = df[~df['robot_id'].isin([1, 2])]
+ 
+    if not invalid_robot_ids.empty:
+        df.drop(invalid_robot_ids.index, inplace=True)
+ 
+    invalid_sensor_types = df[~df['sensor_type'].isin(['encoder', 'load_cell'])]
+ 
+    if not invalid_sensor_types.empty:
+        df.drop(invalid_sensor_types.index, inplace=True)
+ 
+    # Calculate outliers via a z-score (SD from the average) method
+    def detect_outliers_zscore(df, column, threshold=3):
+        z_scores = stats.zscore(df[column])
+        outliers = df[np.abs(z_scores) > threshold]
+        return outliers
+ 
+    outliers_zscore = detect_outliers_zscore(df, 'value')
+    print("\nOutliers detected using Z-score method:")
+    print(outliers_zscore)
+    
+
+    
+    ### DATA TRANSFORMATION
+ 
+    # Pivot the DataFrame to wide format
+    pivot_df = df.pivot_table(index='time', columns=['field', 'robot_id'], values='value')
+ 
+    # Flatten the multi-index columns
+    pivot_df.columns = [f'{field}_{robot_id}' for field, robot_id in pivot_df.columns]
+ 
+    df_grouped = pivot_df.groupby(pivot_df.index).first()
+ 
+    # Forward fill and backward fill to fill NaN values  This fills NaN values by propagating the last valid observation forward and if not possible will use the last valid observation backward
+
+    df_filled = df_grouped.fillna(method='ffill').fillna(method='bfill')
+    
+    #another option is to interpolate the df_filled via a linear method
+    #df_filled = df_grouped.interpolate(method='linear')
+ 
+    # Extract the run_uuid corresponding to each time, given this is one pod two jobs shouldnt occur at the exact same time
+    run_uuid_df = df[['time', 'run_uuid']].drop_duplicates().set_index('time')
+ 
+    # Merge run_uuid back into df_filled
+    df_filled = df_filled.merge(run_uuid_df, left_index=True, right_index=True, how='left')
+ 
+    
+    ### Feature Engineering 
+    ##these calculations are summaries across all jobs but could also be done for each individual job
+    
+    # Calculate Velocity components for each robot: displacement/ change in time
+    df_filled['vx_1'] = df_filled['x_1'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['vy_1'] = df_filled['y_1'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['vz_1'] = df_filled['z_1'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    
+    df_filled['vx_2'] = df_filled['x_2'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['vy_2'] = df_filled['y_2'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['vz_2'] = df_filled['z_2'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    
+    # Calculate Acceleration components for each robot: change in velocity/ change in time
+    df_filled['ax_1'] = df_filled['vx_1'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['ay_1'] = df_filled['vy_1'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['az_1'] = df_filled['vz_1'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    
+    df_filled['ax_2'] = df_filled['vx_2'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['ay_2'] = df_filled['vy_2'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    df_filled['az_2'] = df_filled['vz_2'].diff() / df_filled.index.to_series().diff().dt.total_seconds()
+    
+    # Calculate Total Velocity for each robot
+    df_filled['v1'] = np.sqrt(df_filled['vx_1']**2 + df_filled['vy_1']**2 + df_filled['vz_1']**2)
+    df_filled['v2'] = np.sqrt(df_filled['vx_2']**2 + df_filled['vy_2']**2 + df_filled['vz_2']**2)
+    
+    # Calculate Total Acceleration for each robot
+    df_filled['a1'] = np.sqrt(df_filled['ax_1']**2 + df_filled['ay_1']**2 + df_filled['az_1']**2)
+    df_filled['a2'] = np.sqrt(df_filled['ax_2']**2 + df_filled['ay_2']**2 + df_filled['az_2']**2)
+    
+    # Calculate Total Force for each robot 
+    df_filled['f1'] = np.sqrt(df_filled['fx_1']**2 + df_filled['fy_1']**2 + df_filled['fz_1']**2)
+    df_filled['f2'] = np.sqrt(df_filled['fx_2']**2 + df_filled['fy_2']**2 + df_filled['fz_2']**2)
+    
+    print("\nFinal DataFrame (df_filled):")
+    print(df_filled.head())
+ 
+    ### Save df_filled to SQL table
+    
+    conn = sqlite3.connect(':memory:')  # Create an in-memory SQLite database
+    df_filled.to_sql(sql_table_name, conn, if_exists='replace', index=True)
+ 
+    print(f"\nData saved to SQL table '{sql_table_name}'")
+ 
+    return conn
+ 
+
+def query_sql_table(conn, sql_query):
+    # Execute a SQL query and return the result as a DataFrame
+    df_result = pd.read_sql_query(sql_query, conn)
+    return df_result
+ 
+# Example usage:
+parquet_file_path = "sample.parquet"
+sql_table_name = "cleaned_data"
+ 
+# Load, clean, save to SQL, and get the connection
+conn = load_clean_save(parquet_file_path, sql_table_name)
+ 
+# query check
+sql_query = f"SELECT * FROM {sql_table_name} LIMIT 10"
+result_df = query_sql_table(conn, sql_query)
+ 
+print("\nQuery Result DataFrame:")
+print(result_df)
+
+
+sql_query = 'SELECT DISTINCT run_uuid, ' \
+            'MIN(time) OVER (PARTITION BY run_uuid) as start_time, ' \
+            'MAX(time) OVER (PARTITION BY run_uuid) as end_time, ' \
+            'MAX(julianday(time)) OVER (PARTITION BY run_uuid) - MIN(julianday(time)) OVER (PARTITION BY run_uuid) as total_time_days, ' \
+            'MAX(x_1) OVER (PARTITION BY run_uuid) - MIN(x_1) OVER (PARTITION BY run_uuid) as total_x1_movement, ' \
+            'MAX(x_2) OVER (PARTITION BY run_uuid) - MIN(x_2) OVER (PARTITION BY run_uuid) as total_x2_movement, ' \
+            'MAX(y_1) OVER (PARTITION BY run_uuid) - MIN(y_1) OVER (PARTITION BY run_uuid) as total_y1_movement, ' \
+            'MAX(y_2) OVER (PARTITION BY run_uuid) - MIN(y_2) OVER (PARTITION BY run_uuid) as total_y2_movement, ' \
+            'MAX(z_1) OVER (PARTITION BY run_uuid) - MIN(z_1) OVER (PARTITION BY run_uuid) as total_z1_movement, ' \
+            'MAX(z_2) OVER (PARTITION BY run_uuid) - MIN(z_2) OVER (PARTITION BY run_uuid) as total_z2_movement ' \
+            f'FROM {sql_table_name}'
+
+result_df = query_sql_table(conn, sql_query)
+
+
+result_df.to_sql("runtime_stats", conn, if_exists='replace', index=True)
+
+sql_query = 'SELECT * FROM runtime_stats'
+result_df = query_sql_table(conn, sql_query)
+print(result_df)
