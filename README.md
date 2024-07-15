@@ -1,9 +1,5 @@
 # Data Engineer Homework
 
-# Objective
-The goal for this assignment is to design a simple ETL process that converts a sample of raw timeseries data into a collection of useful datasets and statistics relevant for work we do at Machina Labs. You can use whatever tools you like but make sure to include instructions in your submission for how your submission should be used and what dependencies it has. For example, if you choose to use python + pandas for data processing please include a `requirements.txt` file (in the case of pip) or `environment.yml` file (in the case of conda) as well as instructions for how we should run your solution code. 
-
-
 ### 1. Sensor Data Missing and Pipeline Robustness
  
 #### Explanation:
