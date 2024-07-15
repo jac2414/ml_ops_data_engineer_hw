@@ -2,8 +2,8 @@
 
 ### 1. Sensor Data Missing and Pipeline Robustness
  
-#### Explanation:
-If one of the sensors was missing some data, our pipeline is designed to handle such scenarios gracefully. Here’s how:
+#### Explanation and Response to Qs:
+If one of the sensors was missing some data, this pipeline is designed to handle such scenarios gracefully. Here’s how:
  
 - **Handling NaN Values**: The pipeline includes steps to fill NaN values using interpolation (`df['value'].interpolate(method='linear')`) for the `value` column, which assumes that sensor readings change linearly over time. For other columns like `time`, `robot_id`, and `run_uuid`, we use forward fill (`fillna(method='ffill')`) and backward fill (`fillna(method='bfill')`) methods, which propagate the last valid observation forward and backward respectively.
 - **Assumptions**: The pipeline does assume a certain structure for the data, specifically that the data contains columns like `time`, `value`, `field`, `robot_id`, `run_uuid`, and `sensor_type`. It also assumes that the `field` values for `encoder` are among ['x', 'y', 'z'] and for `load_cell` are among ['fx', 'fy', 'fz'].
@@ -17,7 +17,7 @@ If one of the sensors was missing some data, our pipeline is designed to handle 
 ### 2. Choice of Fill Method for `df_filled`
  
 #### Explanation:
-During the step where `df_filled` is first defined, we used the forward fill (`fillna(method='ffill')`) and backward fill (`fillna(method='bfill')`) methods.
+During the step where `df_filled` is first defined, I used the forward fill (`fillna(method='ffill')`) and backward fill (`fillna(method='bfill')`) methods.
  
 #### Benefits and Trade-offs:
 - **Benefits**:
@@ -46,10 +46,3 @@ Certain parts of the pipeline can be parallelized, while others need to be done 
 - **Pivoting and Filling**: Pivoting the DataFrame and filling NaN values must be done sequentially as they transform the structure of the data.
 - **Feature Engineering**: Calculating velocity, acceleration, and other derived features must be done sequentially as each step depends on the previous calculations.
  
-### Summary
- 
-1. **Pipeline Robustness**: The pipeline is designed to handle missing data gracefully using interpolation and fill methods. It assumes a certain data structure but includes checks to handle inconsistencies.
-2. **Fill Method Choice**: Forward and backward fill methods were chosen for simplicity and consistency, ensuring no gaps in the data. However, they assume continuity and may introduce bias in case of long sequences of missing data.
-3. **Parallelization**: Reading data, data type checks, and consistency checks can be parallelized. NaN handling, pivoting, and feature engineering need to be done sequentially due to dependencies.
- 
-This approach ensures that the pipeline is robust, efficient, and capable of handling common data issues, making it suitable for real-world applications.
